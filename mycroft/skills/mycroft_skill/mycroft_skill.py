@@ -20,7 +20,7 @@ import re
 import traceback
 from itertools import chain
 from os import walk
-from os.path import join, abspath, dirname, basename, exists
+from os.path import join, abspath, dirname, basename, exists, expanduser
 from threading import Event, Timer
 
 from adapt.intent import Intent, IntentBuilder
@@ -38,7 +38,8 @@ from mycroft.metrics import report_metric
 from mycroft.util import (
     resolve_resource_file,
     play_audio_file,
-    camel_case_split
+    camel_case_split,
+    ensure_directory_exists
 )
 from mycroft.util.log import LOG
 from mycroft.util.format import pronounce_number, join_list
@@ -123,16 +124,6 @@ class MycroftSkill:
         #: Member variable containing the absolute path of the skill's root
         #: directory. E.g. /opt/mycroft/skills/my-skill.me/
         self.root_dir = dirname(abspath(sys.modules[self.__module__].__file__))
-        if use_settings:
-            self.settings = get_local_settings(self.root_dir, self.name)
-            self._initial_settings = deepcopy(self.settings)
-        else:
-            self.settings = None
-
-        #: Set to register a callback method that will be called every time
-        #: the skills settings are updated. The referenced method should
-        #: include any logic needed to handle the updated settings.
-        self.settings_change_callback = None
 
         self.gui = SkillGUI(self)
 
@@ -141,6 +132,18 @@ class MycroftSkill:
         self.bind(bus)
         #: Mycroft global configuration. (dict)
         self.config_core = Configuration.get()
+
+        self.settings = None
+        self.settings_dir = None
+        if use_settings:
+            prefix = self.config_core['skills'].get('settings_prefix')
+            self._init_settings(prefix)
+
+        #: Set to register a callback method that will be called every time
+        #: the skills settings are updated. The referenced method should
+        #: include any logic needed to handle the updated settings.
+        self.settings_change_callback = None
+
         self.dialog_renderer = None
 
         #: Filesystem access to skill specific folder.
@@ -156,6 +159,24 @@ class MycroftSkill:
         # Delegator classes
         self.event_scheduler = EventSchedulerInterface(self.name)
         self.intent_service = IntentServiceInterface()
+
+    def _init_settings(self, prefix):
+        """Setup skill settings.
+
+        Arguments:
+            prefix (None or str): path to directory to keep skill settings
+                                  if None, use the skill folder.
+        """
+        if prefix:
+            self.settings_dir = join(prefix, 'mycroft', 'skills',
+                                        basename(self.root_dir))
+            self.settings_dir = expanduser(self.settings_dir)
+            ensure_directory_exists(self.settings_dir, permissions=0o775)
+        else:
+            self.settings_dir = self.root_dir
+
+        self.settings = get_local_settings(self.settings_dir, self.name)
+        self._initial_settings = deepcopy(self.settings)
 
     @property
     def enclosure(self):
@@ -271,7 +292,7 @@ class MycroftSkill:
             if remote_settings is not None:
                 LOG.info('Updating settings for skill ' + self.name)
                 self.settings.update(**remote_settings)
-                save_settings(self.root_dir, self.settings)
+                save_settings(self.settings_dir, self.settings)
                 if self.settings_change_callback is not None:
                     self.settings_change_callback()
 
@@ -811,7 +832,7 @@ class MycroftSkill:
             """Store settings and indicate that the skill handler has completed
             """
             if self.settings != self._initial_settings:
-                save_settings(self.root_dir, self.settings)
+                save_settings(self.settings_dir, self.settings)
                 self._initial_settings = self.settings
             if handler_info:
                 msg_type = handler_info + '.complete'
@@ -1233,7 +1254,7 @@ class MycroftSkill:
 
         # Store settings
         if self.settings != self._initial_settings:
-            save_settings(self.root_dir, self.settings)
+            save_settings(self.settings_dir, self.settings)
 
         if self.settings_meta:
             self.settings_meta.stop()
