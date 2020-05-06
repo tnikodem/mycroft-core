@@ -178,6 +178,7 @@ def print_ww_found_status(word, short_name):
 
 
 def test_false_negative(directory):
+
     file_names = get_file_names(directory)
 
     # Grab audio format info from first file
@@ -236,3 +237,7 @@ def run_test():
         print(bold_str("Warning: No wav files found in " + false_pos_dir))
 
     print("Complete!")
+
+
+if __name__ == '__main__':
+    run_test()
