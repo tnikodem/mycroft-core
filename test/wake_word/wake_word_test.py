@@ -21,8 +21,11 @@ import pyee
 from os.path import dirname, join
 from speech_recognition import AudioSource
 
-from mycroft.client.speech.listener import RecognizerLoop
+from mycroft.configuration import Configuration
 from mycroft.client.speech.mic import ResponsiveRecognizer
+
+
+from mycroft.client.speech.hotword_factory import PreciseHotword
 
 """Tests for determining the accuracy of the selected wake word engine."""
 
@@ -74,6 +77,7 @@ class FileStream:
 
 class FileMockMicrophone(AudioSource):
     def __init__(self, file_name):
+        super().__init__()
         self.stream = FileStream(file_name)
         self.SAMPLE_RATE = self.stream.sample_rate
         self.SAMPLE_WIDTH = self.stream.sample_width
@@ -91,12 +95,10 @@ class FileMockMicrophone(AudioSource):
 
 
 class AudioTester:
-    def __init__(self, samp_rate):
-        print()  # Pad debug messages
-        self.ww_recognizer = RecognizerLoop().create_wake_word_recognizer()
-        self.listener = ResponsiveRecognizer(self.ww_recognizer)
+    def __init__(self):
+        ww_recognizer = PreciseHotword(key_phrase="hey mycroft")
+        self.listener = ResponsiveRecognizer(wake_word_recognizer=ww_recognizer)
         self.listener.config['confirm_listening'] = False
-        print()
 
     def test_audio(self, file_name):
         source = FileMockMicrophone(file_name)
@@ -182,7 +184,7 @@ def test_false_negative(directory):
     file_names = get_file_names(directory)
 
     # Grab audio format info from first file
-    tester = AudioTester(file_frame_rate(file_names[0]))
+    tester = AudioTester()
 
     def on_file_finish(short_name, times_found):
         not_found_str = Color.RED + "Not found"
@@ -193,17 +195,15 @@ def test_false_negative(directory):
     num_found = test_audio_files(tester, file_names, on_file_finish)
     total = len(file_names)
 
-    print
     print("Found " + bold_str(num_found) + " out of " + bold_str(total))
     print(bold_str(to_percent(float(num_found) / total)) + " accuracy.")
-    print
 
 
 def test_false_positive(directory):
     file_names = get_file_names(directory)
 
     # Grab audio format info from first file
-    tester = AudioTester(file_frame_rate(file_names[0]))
+    tester = AudioTester()
 
     def on_file_finish(short_name, times_found):
         not_found_str = Color.GREEN + "Not found"
@@ -214,13 +214,13 @@ def test_false_positive(directory):
     num_found = test_audio_files(tester, file_names, on_file_finish)
     total = len(file_names)
 
-    print
     print("Found " + bold_str(num_found) + " false positives")
     print("in " + bold_str(str(total)) + " files")
-    print
 
 
 def run_test():
+    Configuration.get(offline=True)
+
     directory = join(dirname(__file__), 'data')
 
     false_neg_dir = join(directory, 'with_wake_word')

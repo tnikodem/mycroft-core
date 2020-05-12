@@ -177,9 +177,11 @@ def main():
     global config
     reset_sigint_handler()
     PIDLock("voice")
+
+    config = Configuration.get(offline=True)
     bus = MessageBusClient()  # Mycroft messagebus, see mycroft.messagebus
     Configuration.set_config_update_handlers(bus)
-    config = Configuration.get()
+
 
     # Register handlers on internal RecognizerLoop bus
     loop = RecognizerLoop()

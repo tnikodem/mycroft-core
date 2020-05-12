@@ -14,15 +14,17 @@
 #
 import time
 from threading import Thread
-import speech_recognition as sr
+from queue import Queue, Empty
+import json
+
 import pyaudio
 from pyee import EventEmitter
 from requests import RequestException
 from requests.exceptions import ConnectionError
 
 from mycroft import dialog
-from mycroft.client.speech.hotword_factory import HotWordFactory
 from mycroft.client.speech.mic import MutableMicrophone, ResponsiveRecognizer
+from mycroft.client.speech.hotword_factory import PreciseHotword
 from mycroft.configuration import Configuration
 from mycroft.metrics import MetricsAggregator, Stopwatch, report_timing
 from mycroft.session import SessionManager
@@ -30,9 +32,6 @@ from mycroft.stt import STTFactory
 from mycroft.util import connected
 from mycroft.util.log import LOG
 from mycroft.util import find_input_device
-from queue import Queue, Empty
-import json
-from copy import deepcopy
 
 
 MAX_MIC_RESTARTS = 20
@@ -77,7 +76,7 @@ class AudioProducer(Thread):
     def run(self):
         restart_attempts = 0
         with self.mic as source:
-            self.recognizer.adjust_for_ambient_noise(source)
+            # self.recognizer.adjust_for_ambient_noise(source)
             while self.state.running:
                 try:
                     audio = self.recognizer.listen(source, self.emitter,
@@ -226,8 +225,8 @@ class AudioConsumer(Thread):
                 send_unknown_intent()
                 LOG.info('no words were transcribed')
             return text
-        except sr.RequestError as e:
-            LOG.error("Could not request Speech Recognition {0}".format(e))
+        # except sr.RequestError as e:
+        #     LOG.error("Could not request Speech Recognition {0}".format(e))
         except ConnectionError as e:
             LOG.error("Connection Error: {0}".format(e))
 
@@ -284,82 +283,27 @@ class RecognizerLoop(EventEmitter):
 
     def _load_config(self):
         """Load configuration parameters from configuration."""
-        config = Configuration.get()
-        self.config_core = config
-        self._config_hash = recognizer_conf_hash(config)
-        self.lang = config.get('lang')
-        self.config = config.get('listener')
-        rate = self.config.get('sample_rate')
 
-        device_index = self.config.get('device_index')
-        device_name = self.config.get('device_name')
-        if not device_index and device_name:
-            device_index = find_input_device(device_name)
-
-        LOG.debug('Using microphone (None = default): '+str(device_index))
-
-        self.microphone = MutableMicrophone(device_index, rate,
-                                            mute=self.mute_calls > 0)
-
-        self.wakeword_recognizer = self.create_wake_word_recognizer()
-        # TODO - localization
-        self.wakeup_recognizer = self.create_wakeup_recognizer()
-        self.responsive_recognizer = ResponsiveRecognizer(
-            self.wakeword_recognizer)
         self.state = RecognizerLoopState()
 
-    def create_wake_word_recognizer(self):
-        """Create a local recognizer to hear the wakeup word
+        config = Configuration.get()
 
-        For example 'Hey Mycroft'.
+        # Hash to reload config if changed
+        self._config_hash = recognizer_conf_hash(config)
 
-        The method uses the hotword entry for the selected wakeword, if
-        one is missing it will fall back to the old phoneme and threshold in
-        the listener entry in the config.
+        # Load Microphone
+        listener_config = config.get('listener')
+        sample_rate = listener_config.get('sample_rate')
+        device_index = listener_config.get('device_index')
+        device_name = listener_config.get('device_name')
+        if not device_index and device_name:
+            device_index = find_input_device(device_name)
+        LOG.debug(f'Using microphone name={device_name} index={device_index}')
+        self.microphone = MutableMicrophone(device_index, sample_rate, mute=self.mute_calls > 0)
 
-        If the hotword entry doesn't include phoneme and threshold values these
-        will be patched in using the defaults from the config listnere entry.
-        """
-        LOG.info('Creating wake word engine')
-        word = self.config.get('wake_word', 'hey mycroft')
-
-        # TODO remove this, only for server settings compatibility
-        phonemes = self.config.get('phonemes')
-        thresh = self.config.get('threshold')
-
-        # Since we're editing it for server backwards compatibility
-        # use a copy so we don't alter the hash of the config and
-        # trigger a reload.
-        config = deepcopy(self.config_core.get('hotwords', {}))
-        if word not in config:
-            # Fallback to using config from "listener" block
-            LOG.warning('Wakeword doesn\'t have an entry falling back'
-                        'to old listener config')
-            config[word] = {'module': 'precise'}
-            if phonemes:
-                config[word]['phonemes'] = phonemes
-            if thresh:
-                config[word]['threshold'] = thresh
-            if phonemes is None or thresh is None:
-                config = None
-        else:
-            LOG.info('Using hotword entry for {}'.format(word))
-            if 'phonemes' not in config[word]:
-                LOG.warning('Phonemes are missing falling back to listeners '
-                            'configuration')
-                config[word]['phonemes'] = phonemes
-            if 'threshold' not in config[word]:
-                LOG.warning('Threshold is missing falling back to listeners '
-                            'configuration')
-                config[word]['threshold'] = thresh
-
-        return HotWordFactory.create_hotword(word, config, self.lang,
-                                             loop=self)
-
-    def create_wakeup_recognizer(self):
-        LOG.info("creating stand up word engine")
-        word = self.config.get("stand_up_word", "wake up")
-        return HotWordFactory.create_hotword(word, lang=self.lang, loop=self)
+        # Load Wakeword Engine
+        self.wakeword_recognizer = PreciseHotword(key_phrase="hey mycroft")
+        self.responsive_recognizer = ResponsiveRecognizer(self.wakeword_recognizer)
 
     def start_async(self):
         """Start consumer and producer threads."""
@@ -369,21 +313,24 @@ class RecognizerLoop(EventEmitter):
         stream_handler = None
         if stt.can_stream:
             stream_handler = AudioStreamHandler(queue)
-        self.producer = AudioProducer(self.state, queue, self.microphone,
-                                      self.responsive_recognizer, self,
-                                      stream_handler)
+        self.producer = AudioProducer(state=self.state,
+                                      queue=queue,
+                                      mic=self.microphone,
+                                      recognizer=self.responsive_recognizer,
+                                      emitter=self,
+                                      stream_handler=stream_handler)
         self.producer.start()
-        self.consumer = AudioConsumer(self.state, queue, self,
-                                      stt, self.wakeup_recognizer,
-                                      self.wakeword_recognizer)
-        self.consumer.start()
+        # self.consumer = AudioConsumer(self.state, queue, self,
+        #                               stt, self.wakeup_recognizer,
+        #                               self.wakeword_recognizer)
+        # self.consumer.start()
 
     def stop(self):
         self.state.running = False
         self.producer.stop()
         # wait for threads to shutdown
         self.producer.join()
-        self.consumer.join()
+        # self.consumer.join()
 
     def mute(self):
         """Mute microphone and increase number of requests to mute."""
@@ -419,10 +366,6 @@ class RecognizerLoop(EventEmitter):
         self.state.sleeping = False
 
     def run(self):
-        """Start and reload mic and STT handling threads as needed.
-
-        Wait for KeyboardInterrupt and shutdown cleanly.
-        """
         try:
             self.start_async()
         except Exception:
@@ -433,10 +376,8 @@ class RecognizerLoop(EventEmitter):
         # Handle reload of consumer / producer if config changes
         while self.state.running:
             try:
-                time.sleep(1)
-                current_hash = recognizer_conf_hash(Configuration().get())
-                if current_hash != self._config_hash:
-                    self._config_hash = current_hash
+                time.sleep(10)
+                if recognizer_conf_hash(Configuration().get()) != self._config_hash:
                     LOG.debug('Config has changed, reloading...')
                     self.reload()
             except KeyboardInterrupt as e:

@@ -180,7 +180,7 @@ class Configuration:
     __patch = {}  # Patch config that skills can update to override config
 
     @staticmethod
-    def get(configs=None, cache=True):
+    def get(configs=None, cache=True, offline=False):
         """
             Get configuration, returns cached instance if available otherwise
             builds a new configuration dict.
@@ -192,10 +192,10 @@ class Configuration:
         if Configuration.__config:
             return Configuration.__config
         else:
-            return Configuration.load_config_stack(configs, cache)
+            return Configuration.load_config_stack(configs=configs, cache=cache, offline=offline)
 
     @staticmethod
-    def load_config_stack(configs=None, cache=False):
+    def load_config_stack(configs=None, cache=False, offline=False):
         """
             load a stack of config dicts into a single dict
 
@@ -206,9 +206,12 @@ class Configuration:
             Returns: merged dict of all configuration files
         """
         if not configs:
-            configs = [LocalConf(DEFAULT_CONFIG), RemoteConf(),
-                       LocalConf(SYSTEM_CONFIG), LocalConf(USER_CONFIG),
-                       Configuration.__patch]
+            configs = [LocalConf(DEFAULT_CONFIG)]
+            if not offline:
+                configs += [RemoteConf()]
+            configs += [LocalConf(SYSTEM_CONFIG),
+                        LocalConf(USER_CONFIG),
+                        Configuration.__patch]
         else:
             # Handle strings in stack
             for index, item in enumerate(configs):
