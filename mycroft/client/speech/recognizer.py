@@ -19,9 +19,7 @@ import os
 import pyaudio
 import audioop
 
-from time import sleep, time as get_time
-from threading import Thread, Lock
-from speech_recognition import Microphone, AudioSource, AudioData
+from speech_recognition import AudioData
 from tempfile import gettempdir
 
 from mycroft.configuration import Configuration
@@ -40,11 +38,15 @@ class ResponsiveRecognizer:
         self.wake_word_recognizer = wake_word_recognizer
         self.wake_word_name = wake_word_recognizer.key_phrase
 
-        self.audio = pyaudio.PyAudio()
+        self.audio_file = None
+        if self.config.get('confirm_listening'):
+            self.audio = pyaudio.PyAudio()
 
         # Signal statuses
         self._stop_signaled = False
         self._listen_triggered = False
+
+        self.audio_file = resolve_resource_file(self.config.get('sounds').get('start_listening'))
 
         # Check the config for the flag to save wake words, utterances
         # and for a path under which to save them
@@ -58,14 +60,12 @@ class ResponsiveRecognizer:
         if self.save_utterances and not os.path.isdir(self.saved_utterances_dir):
             os.mkdir(self.saved_utterances_dir)
 
-
         # Config for recording audio
         self.sec_per_buffer = 0.064  # TODO calculate dynamically
         # dynamic noise level
         self.dynamic_energy_threshold = 13   # only start value here
         self.min_rms_threshold = 1
         self.max_rms_threshold = 40
-        # wake word
         # phrase recording
         self.min_loud_sec_per_phrase = 0.5
         self.min_loud_chunks = int(self.min_loud_sec_per_phrase / self.sec_per_buffer)
@@ -103,12 +103,9 @@ class ResponsiveRecognizer:
                 if self.save_wake_words:
                     last_chunks.append(chunk)
                 self.wake_word_recognizer.update(chunk)  # the heavy work is done in this method
-                if (frame_idx % 2) == 0:
-                    LOG.info(f"+ {frame_idx} rms: {audioop.rms(chunk, source.SAMPLE_WIDTH)} threshold: {round(self.dynamic_energy_threshold, 1)} len {len(chunk)}")
             else:
                 skipped_frames += 1
                 if skipped_frames > 100:
-                    LOG.info(f"- {frame_idx} rms: {audioop.rms(chunk, source.SAMPLE_WIDTH)} threshold: {round(self.dynamic_energy_threshold, 1)}")
                     self.dynamic_energy_threshold = max(self.dynamic_energy_threshold*0.99, self.min_rms_threshold)
                     skipped_frames = 0
 
@@ -129,19 +126,6 @@ class ResponsiveRecognizer:
                 return
 
     def _record_phrase(self, source, stream=None):
-        """Record an entire spoken phrase.
-        Essentially, this code waits for a period of silence and then returns
-        the audio.  If silence isn't detected, it will terminate and return
-        a buffer of self.recording_timeout duration.
-        Args:
-            source (AudioSource):  Source producing the audio chunks
-            stream (AudioStreamHandler): Stream target that will receive chunks
-                                         of the utterance audio while it is
-                                         being recorded.
-        Returns:
-            bytearray: complete audio buffer recorded, including any
-                       silence at the end of the user's utterance
-        """
         if stream:
             stream.stream_start()  # stream_stop is done outside in a try catch case
         num_chunks = 0
@@ -171,28 +155,12 @@ class ResponsiveRecognizer:
         return b"".join(all_chunks)
 
     def listen(self, source, emitter, stream_handler=None):
-        """Listens for chunks of audio that Mycroft should perform STT on.
-        This will listen continuously for a wake-up-word, then return the
-        audio chunk containing the spoken phrase that comes immediately
-        afterwards.
-        Args:
-            source (AudioSource):  Source producing the audio chunks
-            emitter (EventEmitter): Emitter for notifications of when recording
-                                    begins and ends.
-            stream (AudioStreamHandler): Stream target that will receive chunks
-                                         of the utterance audio while it is
-                                         being recorded
-        Returns:
-            AudioData: audio with the user's utterance, minus the wake-up-word
-        """
         self._wait_until_wake_word(source=source, emitter=emitter)
         if self._stop_signaled:
             return
 
-        if self.config.get('confirm_listening'):
-            audio_file = resolve_resource_file(self.config.get('sounds').get('start_listening'))
-            if audio_file:
-                play_wav(audio_file)
+        if self.audio_file:
+            play_wav(self.audio_file)
 
         emitter.emit("recognizer_loop:record_begin")
         frame_data = self._record_phrase(
@@ -202,10 +170,8 @@ class ResponsiveRecognizer:
         audio_data = AudioData(frame_data, source.SAMPLE_RATE, source.SAMPLE_WIDTH)
         emitter.emit("recognizer_loop:record_end")
 
-        if self.config.get('confirm_listening'):
-            audio_file = resolve_resource_file(self.config.get('sounds').get('start_listening'))
-            if audio_file:
-                play_wav(audio_file)
+        if self.audio_file:
+            play_wav(self.audio_file)
 
         if self.save_utterances:
             now_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")

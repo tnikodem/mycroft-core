@@ -38,14 +38,14 @@ from mycroft.util import find_input_device
 
 MAX_MIC_RESTARTS = 20
 
-
+# Audio Stream Tags
 AUDIO_DATA = 0
 STREAM_START = 1
 STREAM_DATA = 2
 STREAM_STOP = 3
 
 
-class AudioStreamHandler(object):
+class AudioStreamHandler:
     def __init__(self, queue):
         self.queue = queue
 
@@ -78,21 +78,16 @@ class AudioProducer(Thread):
     def run(self):
         restart_attempts = 0
         with self.mic as source:
-            # self.recognizer.adjust_for_ambient_noise(source)
             while self.state.running:
                 try:
-                    audio = self.recognizer.listen(source=source,
-                                                   emitter=self.emitter,
+                    # Wait for wakeword and return recorded phrase
+                    audio = self.recognizer.listen(source=source, emitter=self.emitter,
                                                    stream_handler=self.stream_handler)
                     if audio is not None:
                         self.queue.put((AUDIO_DATA, audio))
                     else:
                         LOG.warning("Audio contains no data.")
                 except IOError as e:
-                    # IOError will be thrown if the read is unsuccessful.
-                    # If self.recognizer.overflow_exc is False (default)
-                    # input buffer overflow IOErrors due to not consuming the
-                    # buffers quickly enough will be silently ignored.
                     LOG.exception('IOError Exception in AudioProducer')
                     if e.errno == pyaudio.paInputOverflowed:
                         pass  # Ignore overflow errors
@@ -116,7 +111,6 @@ class AudioProducer(Thread):
                     if self.stream_handler is not None:
                         self.stream_handler.stream_stop()
 
-
     def stop(self):
         """Stop producer thread."""
         self.state.running = False
@@ -127,21 +121,18 @@ class AudioConsumer(Thread):
     """AudioConsumer
     Consumes AudioData chunks off the queue
     """
-
-    # In seconds, the minimum audio size to be sent to remote STT
-    MIN_AUDIO_SIZE = 0.5
-
-    def __init__(self, state, queue, emitter, stt,
-                 wakeup_recognizer, wakeword_recognizer):
+    def __init__(self, state, queue, emitter, stt, wakeword_recognizer):
         super(AudioConsumer, self).__init__()
         self.daemon = True
         self.queue = queue
         self.state = state
         self.emitter = emitter
         self.stt = stt
-        self.wakeup_recognizer = wakeup_recognizer
         self.wakeword_recognizer = wakeword_recognizer
         self.metrics = MetricsAggregator()
+
+        self.sec_per_buffer = 0.064  # TODO calculate dynamically
+        self.min_audio_size = int(0.5/self.sec_per_buffer)
 
     def run(self):
         while self.state.running:
@@ -152,18 +143,11 @@ class AudioConsumer(Thread):
             message = self.queue.get(timeout=0.5)
         except Empty:
             return
-
         if message is None:
             return
-
         tag, data = message
-
         if tag == AUDIO_DATA:
-            if data is not None:
-                if self.state.sleeping:
-                    self.wake_up(data)
-                else:
-                    self.process(data)
+            self.process(data)
         elif tag == STREAM_START:
             self.stt.stream_start()
         elif tag == STREAM_DATA:
@@ -174,71 +158,46 @@ class AudioConsumer(Thread):
             LOG.error("Unknown audio queue type %r" % message)
 
     # TODO: Localization
-    def wake_up(self, audio):
-        if self.wakeup_recognizer.found_wake_word(audio.frame_data):
-            SessionManager.touch()
-            self.state.sleeping = False
-            self.emitter.emit('recognizer_loop:awoken')
-            self.metrics.increment("mycroft.wakeup")
-
-    @staticmethod
-    def _audio_length(audio):
-        return float(len(audio.frame_data)) / (
-            audio.sample_rate * audio.sample_width)
-
-    # TODO: Localization
     def process(self, audio):
-
-        if self._audio_length(audio) >= self.MIN_AUDIO_SIZE:
-            stopwatch = Stopwatch()
-            with stopwatch:
-                transcription = self.transcribe(audio)
-            if transcription:
-                ident = str(stopwatch.timestamp) + str(hash(transcription))
-                # STT succeeded, send the transcribed speech on for processing
-                payload = {
-                    'utterances': [transcription],
-                    'lang': self.stt.lang,
-                    'session': SessionManager.get().session_id,
-                    'ident': ident
-                }
-                self.emitter.emit("recognizer_loop:utterance", payload)
-                self.metrics.attr('utterances', [transcription])
-
-                # Report timing metrics
-                report_timing(ident, 'stt', stopwatch,
-                              {'transcription': transcription,
-                               'stt': self.stt.__class__.__name__})
-            else:
-                ident = str(stopwatch.timestamp)
-        else:
+        if audio is None or len(audio.frame_data) < self.min_audio_size:
             LOG.warning("Audio too short to be processed")
+            return
+
+        stopwatch = Stopwatch()
+        with stopwatch:
+            transcription = self.transcribe(audio)
+
+        if transcription:
+            ident = str(stopwatch.timestamp) + str(hash(transcription))
+            # STT succeeded, send the transcribed speech on for processing
+            payload = {'utterances': [transcription],
+                       'lang': self.stt.lang,
+                       'session': SessionManager.get().session_id,
+                       'ident': ident}
+            self.emitter.emit("recognizer_loop:utterance", payload)
+            self.metrics.attr('utterances', [transcription])
+
+            # Report timing metrics
+            report_timing(ident=ident, system='stt', timing=stopwatch,
+                          additional_data={'transcription': transcription, 'stt': self.stt.__class__.__name__})
 
     def transcribe(self, audio):
-        def send_unknown_intent():
-            """ Send message that nothing was transcribed. """
-            self.emitter.emit('recognizer_loop:speech.recognition.unknown')
-
         try:
-            # Invoke the STT engine on the audio clip
             text = self.stt.execute(audio)
             if text is not None:
                 text = text.lower().strip()
-                LOG.debug("STT: " + text)
+                LOG.info("STT: " + text)
             else:
-                send_unknown_intent()
+                self.emitter.emit('recognizer_loop:speech.recognition.unknown')
                 LOG.info('no words were transcribed')
             return text
-        # except sr.RequestError as e:
-        #     LOG.error("Could not request Speech Recognition {0}".format(e))
         except ConnectionError as e:
             LOG.error("Connection Error: {0}".format(e))
-
             self.emitter.emit("recognizer_loop:no_internet")
         except RequestException as e:
             LOG.error(e.__class__.__name__ + ': ' + str(e))
         except Exception as e:
-            send_unknown_intent()
+            self.emitter.emit('recognizer_loop:speech.recognition.unknown')
             LOG.error(e)
             LOG.error("Speech Recognition could not understand audio")
             return None
@@ -248,13 +207,6 @@ class AudioConsumer(Thread):
         else:
             dialog_name = 'not connected to the internet'
         self.emitter.emit('speak', {'utterance': dialog.get(dialog_name)})
-
-    def __speak(self, utterance):
-        payload = {
-            'utterance': utterance,
-            'session': SessionManager.get().session_id
-        }
-        self.emitter.emit("speak", payload)
 
 
 class RecognizerLoopState:
@@ -276,25 +228,20 @@ def recognizer_conf_hash(config):
 
 class RecognizerLoop(EventEmitter):
     """ EventEmitter loop running speech recognition.
-
     Local wake word recognizer and remote general speech recognition.
     """
-
     def __init__(self):
-        super(RecognizerLoop, self).__init__()
-        self.mute_calls = 0
+        super().__init__()
+        self.producer = None
+        self.consumer = None
         self._load_config()
 
     def _load_config(self):
         """Load configuration parameters from configuration."""
-
         self.state = RecognizerLoopState()
-
         config = Configuration.get()
-
         # Hash to reload config if changed
         self._config_hash = recognizer_conf_hash(config)
-
         # Load Microphone
         listener_config = config.get('listener')
         sample_rate = listener_config.get('sample_rate')
@@ -304,14 +251,16 @@ class RecognizerLoop(EventEmitter):
             device_index = find_input_device(device_name)
         LOG.debug(f'Using microphone name={device_name} index={device_index}')
         self.microphone = Microphone(device_index=device_index, sample_rate=sample_rate, chunk_size=1024)
-
         # Load Wakeword Engine
         self.wakeword_recognizer = PreciseHotword(key_phrase="hey mycroft")
         self.responsive_recognizer = ResponsiveRecognizer(self.wakeword_recognizer)
 
     def start_async(self):
         """Start consumer and producer threads."""
+        if self.state.running:
+            return
         self.state.running = True
+
         stt = STTFactory.create()
         queue = Queue()
         stream_handler = None
@@ -324,30 +273,22 @@ class RecognizerLoop(EventEmitter):
                                       emitter=self,
                                       stream_handler=stream_handler)
         self.producer.start()
-        # self.consumer = AudioConsumer(self.state, queue, self,
-        #                               stt, self.wakeup_recognizer,
-        #                               self.wakeword_recognizer)
-        # self.consumer.start()
+        self.consumer = AudioConsumer(state=self.state, queue=queue, emitter=self, stt=stt,
+                                      wakeword_recognizer=self.wakeword_recognizer)
+        self.consumer.start()
 
     def stop(self):
         self.state.running = False
         self.producer.stop()
         # wait for threads to shutdown
         self.producer.join()
-        # self.consumer.join()
-
-    def sleep(self):
-        self.state.sleeping = True
-
-    def awaken(self):
-        self.state.sleeping = False
+        self.consumer.join()
 
     def run(self):
         try:
             self.start_async()
         except Exception:
-            LOG.exception('Starting producer/consumer threads for listener '
-                          'failed.')
+            LOG.exception('Starting producer/consumer threads for listener failed.')
             return
 
         # Handle reload of consumer / producer if config changes
@@ -360,7 +301,7 @@ class RecognizerLoop(EventEmitter):
             except KeyboardInterrupt as e:
                 LOG.error(e)
                 self.stop()
-                raise  # Re-raise KeyboardInterrupt
+                raise
             except Exception:
                 LOG.exception('Exception in RecognizerLoop')
                 raise
@@ -369,7 +310,5 @@ class RecognizerLoop(EventEmitter):
         """Reload configuration and restart consumer and producer."""
         self.stop()
         self.wakeword_recognizer.stop()
-        # load config
         self._load_config()
-        # restart
         self.start_async()
