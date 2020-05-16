@@ -22,8 +22,10 @@ from pyee import EventEmitter
 from requests import RequestException
 from requests.exceptions import ConnectionError
 
+from speech_recognition import Microphone
+
 from mycroft import dialog
-from mycroft.client.speech.mic import MutableMicrophone, ResponsiveRecognizer
+from mycroft.client.speech.recognizer import ResponsiveRecognizer
 from mycroft.client.speech.hotword_factory import PreciseHotword
 from mycroft.configuration import Configuration
 from mycroft.metrics import MetricsAggregator, Stopwatch, report_timing
@@ -67,11 +69,11 @@ class AudioProducer(Thread):
         super(AudioProducer, self).__init__()
         self.daemon = True
         self.state = state
-        self.queue = queue
+        self.queue = queue  # audio queue
         self.mic = mic
         self.recognizer = recognizer
         self.emitter = emitter
-        self.stream_handler = stream_handler
+        self.stream_handler = stream_handler  # audio stream handler
 
     def run(self):
         restart_attempts = 0
@@ -79,8 +81,9 @@ class AudioProducer(Thread):
             # self.recognizer.adjust_for_ambient_noise(source)
             while self.state.running:
                 try:
-                    audio = self.recognizer.listen(source, self.emitter,
-                                                   self.stream_handler)
+                    audio = self.recognizer.listen(source=source,
+                                                   emitter=self.emitter,
+                                                   stream_handler=self.stream_handler)
                     if audio is not None:
                         self.queue.put((AUDIO_DATA, audio))
                     else:
@@ -112,6 +115,7 @@ class AudioProducer(Thread):
                 finally:
                     if self.stream_handler is not None:
                         self.stream_handler.stream_stop()
+
 
     def stop(self):
         """Stop producer thread."""
@@ -299,7 +303,7 @@ class RecognizerLoop(EventEmitter):
         if not device_index and device_name:
             device_index = find_input_device(device_name)
         LOG.debug(f'Using microphone name={device_name} index={device_index}')
-        self.microphone = MutableMicrophone(device_index, sample_rate, mute=self.mute_calls > 0)
+        self.microphone = Microphone(device_index=device_index, sample_rate=sample_rate, chunk_size=1024)
 
         # Load Wakeword Engine
         self.wakeword_recognizer = PreciseHotword(key_phrase="hey mycroft")
@@ -331,33 +335,6 @@ class RecognizerLoop(EventEmitter):
         # wait for threads to shutdown
         self.producer.join()
         # self.consumer.join()
-
-    def mute(self):
-        """Mute microphone and increase number of requests to mute."""
-        self.mute_calls += 1
-        if self.microphone:
-            self.microphone.mute()
-
-    def unmute(self):
-        """Unmute mic if as many unmute calls as mute calls have been received.
-        """
-        if self.mute_calls > 0:
-            self.mute_calls -= 1
-
-        if self.mute_calls <= 0 and self.microphone:
-            self.microphone.unmute()
-            self.mute_calls = 0
-
-    def force_unmute(self):
-        """Completely unmute mic regardless of the number of calls to mute."""
-        self.mute_calls = 0
-        self.unmute()
-
-    def is_muted(self):
-        if self.microphone:
-            return self.microphone.is_muted()
-        else:
-            return True  # consider 'no mic' muted
 
     def sleep(self):
         self.state.sleeping = True
